@@ -12,6 +12,7 @@ import java.awt.event.WindowEvent
 import javax.swing.BorderFactory
 import javax.swing.DefaultListModel
 import javax.swing.JCheckBox
+import javax.swing.JComboBox
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JList
@@ -60,6 +61,38 @@ List parseMeasurements(String spec) {
             type = name.endsWith('_angle') ? 'angle' : 'length'
         }
         out << [name: name, type: type]
+    }
+    return out
+}
+
+/** Builds the list of view specs, accepting both the multi-view and the
+ *  older single-view config layouts. */
+List parseViews(Map cfg, Closure measParser) {
+    def names = []
+    if (cfg.views) {
+        names = cfg.views.split(',').collect { it.trim() }.findAll { it }
+    } else if (cfg.view) {
+        names = [cfg.view.trim()]
+    }
+    if (!names) throw new IllegalArgumentException('config: no views defined')
+
+    def out = []
+    names.each { String n ->
+        String pfx = 'view.' + n + '.'
+        String px = cfg.get(pfx + 'scale_distance_px', cfg.get('scale_distance_px', '0'))
+        String kn = cfg.get(pfx + 'scale_known', cfg.get('scale_known', '1'))
+        String un = cfg.get(pfx + 'scale_unit', cfg.get('scale_unit', 'mm'))
+        String ms = cfg.get(pfx + 'measurements', cfg.get('measurements', ''))
+
+        double pxv = Double.parseDouble(px)
+        if (pxv <= 0)
+            throw new IllegalArgumentException("config: scale_distance_px missing or invalid for view '${n}'")
+        def meas = measParser(ms)
+        if (!meas)
+            throw new IllegalArgumentException("config: no measurements defined for view '${n}'")
+
+        out << [name: n, scalePx: pxv, scaleKnown: Double.parseDouble(kn),
+                unit: un, meas: meas]
     }
     return out
 }
@@ -136,6 +169,12 @@ class Store {
         return index[key(image, view, structure)]
     }
 
+    /** Any view name already recorded against this image, or null. */
+    String viewRecordedFor(String image) {
+        def hit = rows.find { it.Image == image && it.View }
+        return hit ? hit.View : null
+    }
+
     void put(String folder, String image, String view, String structure,
              String type, double value) {
         String k = key(image, view, structure)
@@ -155,8 +194,7 @@ class Store {
     }
 
     void remove(String image, String view, String structure) {
-        String k = key(image, view, structure)
-        def row = index.remove(k)
+        def row = index.remove(key(image, view, structure))
         if (row != null) {
             rows.remove(row)
             save()
@@ -181,12 +219,17 @@ class Store {
 
 class App {
 
-    String folder, folderName, view, unit
-    double scalePx, scaleKnown
-    List meas
+    String folder, folderName
+    List views                       // list of view spec maps
+    Map viewByName = [:]
+    List<String> cycle               // expected repeating order
     List<String> images
-    String roiDir
+    String roiDir, assignPath
     Store store
+
+    Map assign = [:]                 // basename -> view name (confirmed)
+    Map viewSpec                     // spec of the currently open image
+    String curViewName = null
 
     RoiManager rm
     def imp = null
@@ -198,22 +241,24 @@ class App {
     JFrame frame
     JTextField filterField
     JCheckBox hideDone
+    JComboBox viewCombo
     JList imageList, measList
     DefaultListModel imageModel, measModel
     JLabel countLabel
 
-    App(Map cfg, String folder, Closure splitter, Closure quoter, Closure measParser) {
+    App(Map cfg, String folder, Closure splitter, Closure quoter, Closure measParser,
+        Closure viewParser) {
         this.folder = folder
         this.folderName = new File(folder).getName()
-        this.view = cfg.get('view', 'unspecified')
 
-        this.scalePx = Double.parseDouble(cfg.get('scale_distance_px', '0'))
-        this.scaleKnown = Double.parseDouble(cfg.get('scale_known', '1'))
-        this.unit = cfg.get('scale_unit', 'mm')
-        if (scalePx <= 0) throw new IllegalArgumentException('config: scale_distance_px must be positive')
+        this.views = viewParser(cfg, measParser)
+        views.each { viewByName[it.name] = it }
 
-        this.meas = measParser(cfg.get('measurements', ''))
-        if (!meas) throw new IllegalArgumentException('config: no measurements defined')
+        if (cfg.view_cycle) {
+            this.cycle = cfg.view_cycle.split(',').collect { it.trim() }
+                            .findAll { viewByName.containsKey(it) }
+        }
+        if (!cycle) this.cycle = views.collect { it.name }
 
         def exts = cfg.get('image_extensions', '.jpg,.jpeg,.tif,.tiff,.png')
                       .split(',').collect { it.trim().toLowerCase() }.findAll { it }
@@ -229,12 +274,76 @@ class App {
             new File(folder, cfg.get('output_long', 'measurements_long.csv')).getAbsolutePath(),
             splitter, quoter)
 
+        this.assignPath = new File(folder,
+            cfg.get('view_assign', 'image_views.csv')).getAbsolutePath()
+        loadAssignments(splitter)
+        migrateFromStore()
+
         this.rm = new RoiManager(false)     // hidden scratch manager, zip I/O only
 
         buildGui()
         refreshImageList()
         if (visible) imageList.setSelectedIndex(0)
     }
+
+    // ---------- view assignment ----------
+
+    void loadAssignments(Closure splitter) {
+        def f = new File(assignPath)
+        if (!f.exists()) return
+        def lines = f.readLines()
+        if (!lines) return
+        def hdr = splitter(lines[0])
+        int ci = hdr.indexOf('Image'), cv = hdr.indexOf('View')
+        if (ci < 0 || cv < 0) return
+        lines.drop(1).each { String line ->
+            if (!line.trim()) return
+            def v = splitter(line)
+            if (v.size() > Math.max(ci, cv) && viewByName.containsKey(v[cv])) {
+                assign[v[ci]] = v[cv]
+            }
+        }
+    }
+
+    /** Pre-assign any image that already has measurements recorded, so
+     *  existing work is picked up without re-triaging. */
+    void migrateFromStore() {
+        images.eachWithIndex { String n, int i ->
+            String b = basename(i)
+            if (assign.containsKey(b)) return
+            String v = store.viewRecordedFor(b)
+            if (v && viewByName.containsKey(v)) assign[b] = v
+        }
+        saveAssignments()
+    }
+
+    void saveAssignments() {
+        def sb = new StringBuilder('Image,View\n')
+        images.eachWithIndex { String n, int i ->
+            String b = basename(i)
+            if (assign.containsKey(b)) sb.append(b).append(',').append(assign[b]).append('\n')
+        }
+        new File(assignPath).setText(sb.toString(), 'UTF-8')
+    }
+
+    /** Confirmed assignment, or a prediction from the expected cycle. */
+    String viewNameFor(int i) {
+        String b = basename(i)
+        if (assign.containsKey(b)) return assign[b]
+
+        // walk back to the nearest confirmed image and step forward in the cycle
+        for (int j = i - 1; j >= 0; j--) {
+            String pb = basename(j)
+            if (assign.containsKey(pb)) {
+                int base = cycle.indexOf(assign[pb])
+                if (base >= 0) return cycle[(base + (i - j)) % cycle.size()]
+                break
+            }
+        }
+        return cycle[i % cycle.size()]
+    }
+
+    Map specFor(int i) { return viewByName[viewNameFor(i)] }
 
     // ---------- helpers ----------
 
@@ -246,8 +355,11 @@ class App {
 
     int nDone(int i) {
         String b = basename(i)
-        return meas.count { store.get(b, view, it.name) != null }
+        String v = viewNameFor(i)
+        return viewByName[v].meas.count { store.get(b, v, it.name) != null }
     }
+
+    int nTotal(int i) { return viewByName[viewNameFor(i)].meas.size() }
 
     String roiPath(int i) {
         return new File(roiDir, basename(i) + '_RoiSet.zip').getAbsolutePath()
@@ -256,7 +368,7 @@ class App {
     // ---------- gui ----------
 
     void buildGui() {
-        frame = new JFrame("Morphometrics  -  ${folderName}  [${view}]")
+        frame = new JFrame("Morphometrics  -  ${folderName}")
         frame.setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE)
         frame.addWindowListener(new WindowAdapter() {
             void windowClosing(WindowEvent e) { finish() }
@@ -288,15 +400,22 @@ class App {
             if (!e.getValueIsAdjusting()) onImageSelected()
         }
         def sp = new JScrollPane(imageList)
-        sp.setPreferredSize(new Dimension(300, 420))
+        sp.setPreferredSize(new Dimension(330, 420))
         left.add(sp, BorderLayout.CENTER)
 
         countLabel = new JLabel(' ')
         left.add(countLabel, BorderLayout.SOUTH)
 
-        // ----- right: measurements + actions -----
+        // ----- right: view selector, measurements, actions -----
         def right = new JPanel(new BorderLayout())
         right.setBorder(BorderFactory.createTitledBorder('Measurements'))
+
+        def viewPanel = new JPanel(new BorderLayout())
+        viewCombo = new JComboBox(views.collect { it.name } as String[])
+        viewCombo.addActionListener { onViewChanged() }
+        viewPanel.add(new JLabel('View: '), BorderLayout.WEST)
+        viewPanel.add(viewCombo, BorderLayout.CENTER)
+        right.add(viewPanel, BorderLayout.NORTH)
 
         measModel = new DefaultListModel()
         measList = new JList(measModel)
@@ -305,7 +424,7 @@ class App {
             if (!e.getValueIsAdjusting()) onMeasSelected()
         }
         def sp2 = new JScrollPane(measList)
-        sp2.setPreferredSize(new Dimension(300, 300))
+        sp2.setPreferredSize(new Dimension(300, 280))
         right.add(sp2, BorderLayout.CENTER)
 
         def btns = new JPanel(new GridLayout(0, 2, 4, 4))
@@ -338,7 +457,6 @@ class App {
     void refreshImageList() {
         String want = filterField.getText().trim().toLowerCase()
         boolean hide = hideDone.isSelected()
-        int total = meas.size()
         int keepIdx = curImg
 
         updating = true
@@ -346,10 +464,12 @@ class App {
         visible = []
         images.eachWithIndex { String name, int i ->
             if (want && !name.toLowerCase().contains(want)) return
-            int done = nDone(i)
+            int done = nDone(i), total = nTotal(i)
             if (hide && done == total && i != keepIdx) return
             visible << i
-            imageModel.addElement(String.format('%s   [%d/%d]', name, done, total))
+            String mark = assign.containsKey(basename(i)) ? ' ' : '?'
+            imageModel.addElement(String.format('%s  %s%s [%d/%d]',
+                name, mark, viewNameFor(i), done, total))
         }
         updating = false
 
@@ -359,8 +479,8 @@ class App {
             updating = false
         }
 
-        int complete = (0..<images.size()).count { nDone(it) == total }
-        countLabel.setText(String.format('  %d shown  -  %d/%d images complete  ',
+        int complete = (0..<images.size()).count { nDone(it) == nTotal(it) }
+        countLabel.setText(String.format('  %d shown  -  %d/%d complete  ("?" = view not confirmed)  ',
                                          visible.size(), complete, images.size()))
     }
 
@@ -369,17 +489,19 @@ class App {
         String b = curImg >= 0 ? basename(curImg) : ''
         updating = true
         measModel.clear()
-        meas.each { Map m ->
-            def row = store.get(b, view, m.name)
-            String shown
-            if (row == null) {
-                shown = '--'
-            } else if (m.type == 'angle') {
-                shown = String.format('%.2f deg', Double.parseDouble(row.Value))
-            } else {
-                shown = String.format('%.4f %s', Double.parseDouble(row.Value), unit)
+        if (viewSpec != null) {
+            viewSpec.meas.each { Map m ->
+                def row = store.get(b, curViewName, m.name)
+                String shown
+                if (row == null) {
+                    shown = '--'
+                } else if (m.type == 'angle') {
+                    shown = String.format('%.2f deg', Double.parseDouble(row.Value))
+                } else {
+                    shown = String.format('%.4f %s', Double.parseDouble(row.Value), viewSpec.unit)
+                }
+                measModel.addElement(String.format('%-16s  %s', m.name, shown))
             }
-            measModel.addElement(String.format('%-16s  %s', m.name, shown))
         }
         updating = false
         if (keep >= 0 && keep < measModel.getSize()) measList.setSelectedIndex(keep)
@@ -403,18 +525,21 @@ class App {
         }
 
         curImg = i
+        curViewName = viewNameFor(i)
+        viewSpec = viewByName[curViewName]
+
+        updating = true
+        viewCombo.setSelectedItem(curViewName)
+        updating = false
+
         def newImp = IJ.openImage(new File(folder, images[i]).getAbsolutePath())
         if (newImp == null) {
             IJ.log('Could not open: ' + images[i])
             return
         }
-
-        def cal = newImp.getCalibration()
-        cal.pixelWidth = scaleKnown / scalePx
-        cal.pixelHeight = cal.pixelWidth
-        cal.setUnit(unit)
         newImp.show()
         imp = newImp
+        applyCalibration()
 
         rois = [:]
         String path = roiPath(i)
@@ -428,7 +553,36 @@ class App {
         }
 
         refreshMeasList()
-        measList.setSelectedIndex(0)
+        if (measModel.getSize() > 0) measList.setSelectedIndex(0)
+    }
+
+    void applyCalibration() {
+        if (imp == null || viewSpec == null) return
+        def cal = imp.getCalibration()
+        cal.pixelWidth = viewSpec.scaleKnown / viewSpec.scalePx
+        cal.pixelHeight = cal.pixelWidth
+        cal.setUnit(viewSpec.unit)
+        imp.getWindow()?.repaint()
+    }
+
+    /** Operator changed the view of the current image. */
+    void onViewChanged() {
+        if (updating || curImg < 0) return
+        String chosen = viewCombo.getSelectedItem()
+        if (chosen == null || chosen == curViewName) return
+
+        curViewName = chosen
+        viewSpec = viewByName[chosen]
+        assign[basename(curImg)] = chosen
+        saveAssignments()
+
+        applyCalibration()
+        if (imp != null) imp.deleteRoi()
+
+        refreshMeasList()
+        refreshImageList()
+        if (measModel.getSize() > 0) measList.setSelectedIndex(0)
+        onMeasSelected()
     }
 
     void saveRois() {
@@ -440,8 +594,11 @@ class App {
             if (f.exists()) f.delete()
             return
         }
-        meas.each { Map m ->                 // save in config order
+        viewSpec.meas.each { Map m ->              // save in config order
             if (rois.containsKey(m.name)) rm.addRoi(rois[m.name])
+        }
+        rois.each { String n, Roi r ->             // keep anything from another view
+            if (!viewSpec.meas.any { it.name == n }) rm.addRoi(r)
         }
         rm.runCommand('Deselect')
         rm.runCommand('Save', path)
@@ -451,10 +608,10 @@ class App {
     // ---------- measurement handling ----------
 
     void onMeasSelected() {
-        if (updating || imp == null) return
+        if (updating || imp == null || viewSpec == null) return
         int m = measList.getSelectedIndex()
-        if (m < 0) return
-        def spec = meas[m]
+        if (m < 0 || m >= viewSpec.meas.size()) return
+        def spec = viewSpec.meas[m]
         IJ.setTool(spec.type == 'angle' ? 'angle' : 'line')
 
         if (rois.containsKey(spec.name)) {
@@ -475,10 +632,10 @@ class App {
     }
 
     void record() {
-        if (imp == null) return
+        if (imp == null || viewSpec == null) return
         int m = measList.getSelectedIndex()
-        if (m < 0) return
-        def spec = meas[m]
+        if (m < 0 || m >= viewSpec.meas.size()) return
+        def spec = viewSpec.meas[m]
         def roi = imp.getRoi()
         if (roi == null) {
             IJ.showMessage('Nothing selected on the image.')
@@ -502,20 +659,25 @@ class App {
 
         roi.setName(spec.name)
         rois[spec.name] = roi
-        store.put(folderName, basename(curImg), view, spec.name, spec.type, value)
+
+        // recording confirms the view for this image
+        assign[basename(curImg)] = curViewName
+        saveAssignments()
+
+        store.put(folderName, basename(curImg), curViewName, spec.name, spec.type, value)
         saveRois()
 
         refreshMeasList()
         refreshImageList()
-        if (m + 1 < meas.size()) measList.setSelectedIndex(m + 1)
+        if (m + 1 < viewSpec.meas.size()) measList.setSelectedIndex(m + 1)
     }
 
     void clearCurrent() {
         int m = measList.getSelectedIndex()
-        if (m < 0 || curImg < 0) return
-        def spec = meas[m]
+        if (m < 0 || curImg < 0 || viewSpec == null) return
+        def spec = viewSpec.meas[m]
         rois.remove(spec.name)
-        store.remove(basename(curImg), view, spec.name)
+        store.remove(basename(curImg), curViewName, spec.name)
         saveRois()
         refreshMeasList()
         refreshImageList()
@@ -544,7 +706,7 @@ class App {
 
     void stepMeas(int d) {
         int m = measList.getSelectedIndex() + d
-        if (m >= meas.size()) {
+        if (viewSpec != null && m >= viewSpec.meas.size()) {
             stepImage(1)        // past the last measurement: move to the next image
             return
         }
@@ -558,11 +720,11 @@ class App {
 
     void nextIncomplete() {
         if (!visible) return
-        int total = meas.size()
         int start = imageList.getSelectedIndex()
         for (int k = 1; k <= visible.size(); k++) {
             int s = (start + k) % visible.size()
-            if (nDone(visible[s]) < total) {
+            int i = visible[s]
+            if (nDone(i) < nTotal(i)) {
                 imageList.setSelectedIndex(s)
                 return
             }
@@ -572,6 +734,7 @@ class App {
 
     void finish() {
         store.save()
+        saveAssignments()
         if (imp != null) {
             imp.changes = false
             imp.close()
@@ -599,9 +762,11 @@ if (od.getFileName() != null) {
             new App(cfg, folder,
                     { String s -> splitCsvLine(s) },
                     { Object v -> csvField(v) },
-                    { String s -> parseMeasurements(s) })
+                    { String s -> parseMeasurements(s) },
+                    { Map c, Closure mp -> parseViews(c, mp) })
         } catch (IllegalArgumentException e) {
             IJ.showMessage('Configuration problem', e.getMessage())
         }
     }
 }
+null
