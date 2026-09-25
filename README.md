@@ -25,7 +25,7 @@ it can be used for any set of images you measure by hand.
 - **Each view has a fixed magnification**, so one scale per view is enough.
 - **Subjects sit in a similar place in the frame each time.** Measurement start
   positions and zoom are remembered per view, so the more consistent the
-  framing, the less adjusting you do.
+  framing, the less adjusting you do (this can be disabled though).
 
 ## Installation
 
