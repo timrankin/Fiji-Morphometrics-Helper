@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software in published work, please cite it as below."
+title: "Morphometrics Helper for Fiji"
+type: software
+authors:
+  - family-names: Rankin
+    given-names: Timothy J.
+    orcid: "https://orcid.org/0009-0003-3099-7593"
+repository-code: "https://github.com/timrankin/Fiji-Morphometrics-Helper"
+license: MIT
+abstract: >-
+  A Fiji script for recording manual length and angle measurements across
+  folders of images, with per-view scales, remembered start positions and
+  zoom, and saved selections behind every value.
+keywords:
+  - Fiji
+  - ImageJ
+  - morphometrics
+  - zebrafish

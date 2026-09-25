@@ -134,3 +134,14 @@ Please use [GitHub Issues](https://github.com/timrankin/Fiji-Morphometrics-Helpe
 for bug reports, questions and feature requests. For a bug, include your Fiji
 version, your `morphometrics_config.txt`, and any error from Fiji's Console
 (**Window > Console**).
+
+## Citing
+
+If you use Morphometrics Helper in published work, please cite it. The
+**Cite this repository** button on the GitHub page gives the reference in APA
+and BibTeX formats.
+
+## License
+
+[MIT](LICENSE). You are free to use, modify and share it; copies must keep the
+copyright notice.
