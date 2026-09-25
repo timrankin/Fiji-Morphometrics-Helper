@@ -12,6 +12,8 @@ cartilage, head and body measurements), but nothing in it is specific to fish:
 the views, measurements and scales all come from a plain-text config file, so
 it can be used for any set of images you measure by hand.
 
+![The Morphometrics Helper window beside an Alcian blue-stained ventral zebrafish head, with the ceratohyal angle (CH-CH_angle) placed on the image and recorded as 91.88 degrees](docs/screenshot.png)
+
 ## What it assumes
 
 - **One folder per batch of images.** The config, results and saved selections
