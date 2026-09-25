@@ -5,17 +5,20 @@
 
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.awt.GraphicsEnvironment
 import java.awt.GridLayout
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 
 import javax.swing.BorderFactory
+import javax.swing.BoxLayout
 import javax.swing.DefaultListModel
 import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JFrame
 import javax.swing.JLabel
 import javax.swing.JList
+import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JButton
 import javax.swing.JScrollPane
@@ -24,11 +27,12 @@ import javax.swing.ListSelectionModel
 import javax.swing.event.DocumentListener
 
 import ij.IJ
+import ij.Prefs
 import ij.gui.Line
 import ij.gui.PolygonRoi
 import ij.gui.Roi
+import ij.gui.WaitForUserDialog
 import ij.io.DirectoryChooser
-import ij.io.OpenDialog
 import ij.plugin.frame.RoiManager
 
 // ------------------------------------------------------------
@@ -45,6 +49,49 @@ Map parseConfig(String path) {
         }
     }
     return cfg
+}
+
+void writeConfigTemplate(File f) {
+    f.setText('''\
+# Morphometrics Helper configuration
+# Lines starting with # are comments. Format: key = value
+
+# The views (image orientations) found in this folder, comma-separated.
+views = lateral, dorsal
+
+# Order the views repeat in across the sorted image list. Used to predict
+# each image's view until it is confirmed. Defaults to the order above.
+view_cycle = lateral, dorsal
+
+# Per-view settings, as view.<name>.<key>. A key without the prefix
+# (e.g. scale_unit = mm) applies to every view that doesn't set its own.
+#   scale_distance_px  scale bar length in pixels. 0 = not set yet; the
+#                      Settings window opens so it can be measured on an image.
+#   scale_known        real length of that scale bar (default 1)
+#   scale_unit         unit of scale_known (default mm)
+#   measurements       name[:type] entries separated by ';'
+#                      type is length or angle. If omitted, names ending in
+#                      _angle are angles and everything else is a length.
+#                      Names ending in _width start with a vertical line.
+#   position.<name>    where that measurement's line/angle first appears, as
+#                      fractions of image width/height. Set from Settings.
+
+view.lateral.scale_distance_px = 0
+view.lateral.scale_known = 1
+view.lateral.scale_unit = mm
+view.lateral.measurements = body_length; head_length; eye_diameter; jaw_angle
+
+view.dorsal.scale_distance_px = 0
+view.dorsal.scale_known = 1
+view.dorsal.scale_unit = mm
+view.dorsal.measurements = head_width; interocular_width; fin_angle
+
+# Optional settings (defaults shown)
+# image_extensions = .jpg,.jpeg,.tif,.tiff,.png
+# roi_subdir = RoiSets
+# output_long = measurements_long.csv
+# view_assign = image_views.csv
+''', 'UTF-8')
 }
 
 List parseMeasurements(String spec) {
@@ -85,11 +132,19 @@ List parseViews(Map cfg, Closure measParser) {
         String ms = cfg.get(pfx + 'measurements', cfg.get('measurements', ''))
 
         double pxv = Double.parseDouble(px)
-        if (pxv <= 0)
-            throw new IllegalArgumentException("config: scale_distance_px missing or invalid for view '${n}'")
+        if (pxv < 0)
+            throw new IllegalArgumentException("config: scale_distance_px is negative for view '${n}'")
         def meas = measParser(ms)
         if (!meas)
             throw new IllegalArgumentException("config: no measurements defined for view '${n}'")
+
+        meas.each { Map m ->
+            String pos = cfg.get(pfx + 'position.' + m.name)
+            if (pos) {
+                def v = pos.split(',').collect { Double.parseDouble(it.trim()) }
+                if (v.size() == (m.type == 'angle' ? 6 : 4)) m.pos = v
+            }
+        }
 
         out << [name: n, scalePx: pxv, scaleKnown: Double.parseDouble(kn),
                 unit: un, meas: meas]
@@ -213,13 +268,50 @@ class Store {
     }
 }
 
+/** Rewrites keys in the config file in place, keeping comments and layout. */
+class ConfigFile {
+
+    /** A null value removes the key. New view.<name>.* keys go after the
+     *  last existing line for that view; anything else is appended. */
+    static void update(File f, Map<String, String> updates) {
+        def seen = [] as Set
+        def out = []
+        f.readLines('UTF-8').each { String line ->
+            String t = line.trim()
+            if (t && !t.startsWith('#') && t.contains('=')) {
+                String k = t.substring(0, t.indexOf('=')).trim()
+                if (updates.containsKey(k)) {
+                    seen << k
+                    if (updates[k] != null) out << (k + ' = ' + updates[k])
+                    return
+                }
+            }
+            out << line
+        }
+        updates.each { String k, String v ->
+            if (k in seen || v == null) return
+            int at = -1
+            int dot = k.startsWith('view.') ? k.indexOf('.', 5) : -1
+            if (dot > 0) {
+                String pfx = k.substring(0, dot + 1)
+                out.eachWithIndex { String l, int i -> if (l.trim().startsWith(pfx)) at = i }
+            }
+            if (at >= 0) out.add(at + 1, k + ' = ' + v) else out << (k + ' = ' + v)
+        }
+        f.setText(out.join('\n') + '\n', 'UTF-8')
+    }
+}
+
 // ------------------------------------------------------------
 //  application
 // ------------------------------------------------------------
 
 class App {
 
-    String folder, folderName
+    static final String PREF_ON_TOP = 'morphometrics.on_top'
+    static final String PREF_LOC = 'morphometrics.location'
+
+    String folder, folderName, cfgPath
     List views                       // list of view spec maps
     Map viewByName = [:]
     List<String> cycle               // expected repeating order
@@ -245,10 +337,12 @@ class App {
     JList imageList, measList
     DefaultListModel imageModel, measModel
     JLabel countLabel
+    SettingsWindow settings = null
 
-    App(Map cfg, String folder, Closure splitter, Closure quoter, Closure measParser,
+    App(Map cfg, String cfgPath, String folder, Closure splitter, Closure quoter, Closure measParser,
         Closure viewParser) {
         this.folder = folder
+        this.cfgPath = cfgPath
         this.folderName = new File(folder).getName()
 
         this.views = viewParser(cfg, measParser)
@@ -284,6 +378,13 @@ class App {
         buildGui()
         refreshImageList()
         if (visible) imageList.setSelectedIndex(0)
+
+        def unset = views.find { it.scalePx <= 0 }
+        if (unset) {
+            openSettings(unset.name, "No scale is set for view '${unset.name}'. " +
+                'Open an image of that view, click "Measure scale bar", draw a line ' +
+                'along the scale bar, then click "Use drawn line".')
+        }
     }
 
     // ---------- view assignment ----------
@@ -448,10 +549,41 @@ class App {
         def main = new JPanel(new BorderLayout(8, 8))
         main.add(left, BorderLayout.WEST)
         main.add(right, BorderLayout.CENTER)
+
+        // ----- top: window options -----
+        def onTop = new JCheckBox('Keep this window on top', Prefs.getBoolean(PREF_ON_TOP, true))
+        onTop.addActionListener {
+            frame.setAlwaysOnTop(onTop.isSelected())
+            Prefs.set(PREF_ON_TOP, onTop.isSelected())
+        }
+        def settingsBtn = new JButton('Settings...')
+        settingsBtn.addActionListener { openSettings(null, null) }
+        def options = new JPanel(new BorderLayout())
+        options.add(onTop, BorderLayout.WEST)
+        options.add(settingsBtn, BorderLayout.EAST)
+        main.add(options, BorderLayout.NORTH)
         frame.add(main)
         frame.pack()
-        frame.setLocation(20, 80)
+        placeFrame()
+        frame.setAlwaysOnTop(onTop.isSelected())
         frame.setVisible(true)
+    }
+
+    /** Last position the operator left the panel at, if still on screen;
+     *  otherwise the lower-right corner, clear of the Fiji toolbar. */
+    void placeFrame() {
+        def screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds()
+        int x = screen.x + screen.width - frame.getWidth() - 10
+        int y = screen.y + screen.height - frame.getHeight() - 10
+        String saved = Prefs.get(PREF_LOC, null)
+        if (saved) {
+            def xy = saved.split(',')
+            try {
+                int sx = Integer.parseInt(xy[0]), sy = Integer.parseInt(xy[1])
+                if (screen.contains(sx + 20, sy + 20)) { x = sx; y = sy }
+            } catch (Exception ignored) { }
+        }
+        frame.setLocation(x, y)
     }
 
     void refreshImageList() {
@@ -541,27 +673,36 @@ class App {
         imp = newImp
         applyCalibration()
 
-        rois = [:]
-        String path = roiPath(i)
-        if (new File(path).exists()) {
-            rm.runCommand('reset')
-            rm.runCommand('Open', path)
-            rm.getRoisAsArray().each { Roi roi ->
-                if (roi.getName()) rois[roi.getName()] = roi
-            }
-            rm.runCommand('reset')
-        }
+        rois = loadRois(roiPath(i))
 
         refreshMeasList()
         if (measModel.getSize() > 0) measList.setSelectedIndex(0)
     }
 
+    /** Named ROIs from a saved RoiSet zip, or empty if there is none. */
+    Map loadRois(String path) {
+        def out = [:]
+        if (!new File(path).exists()) return out
+        rm.runCommand('reset')
+        rm.runCommand('Open', path)
+        rm.getRoisAsArray().each { Roi roi ->
+            if (roi.getName()) out[roi.getName()] = roi
+        }
+        rm.runCommand('reset')
+        return out
+    }
+
     void applyCalibration() {
         if (imp == null || viewSpec == null) return
         def cal = imp.getCalibration()
-        cal.pixelWidth = viewSpec.scaleKnown / viewSpec.scalePx
+        if (viewSpec.scalePx > 0) {
+            cal.pixelWidth = viewSpec.scaleKnown / viewSpec.scalePx
+            cal.setUnit(viewSpec.unit)
+        } else {
+            cal.pixelWidth = 1
+            cal.setUnit('pixel')
+        }
         cal.pixelHeight = cal.pixelWidth
-        cal.setUnit(viewSpec.unit)
         imp.getWindow()?.repaint()
     }
 
@@ -614,10 +755,20 @@ class App {
         def spec = viewSpec.meas[m]
         IJ.setTool(spec.type == 'angle' ? 'angle' : 'line')
 
+        double w = imp.getWidth(), h = imp.getHeight()
         if (rois.containsKey(spec.name)) {
-            imp.setRoi(rois[spec.name])
+            // a copy, so unrecorded edits on the image never reach the saved set
+            imp.setRoi((Roi) rois[spec.name].clone())
+        } else if (spec.pos) {
+            def p = spec.pos
+            if (spec.type == 'angle') {
+                float[] xs = [p[0] * w, p[2] * w, p[4] * w] as float[]
+                float[] ys = [p[1] * h, p[3] * h, p[5] * h] as float[]
+                imp.setRoi(new PolygonRoi(xs, ys, 3, Roi.ANGLE))
+            } else {
+                imp.setRoi(new Line(p[0] * w, p[1] * h, p[2] * w, p[3] * h))
+            }
         } else {
-            double w = imp.getWidth(), h = imp.getHeight()
             if (spec.type == 'angle') {
                 // vertex on the left, arms opening to the right
                 float[] xs = [w * 0.60, w * 0.45, w * 0.60] as float[]
@@ -650,6 +801,11 @@ class App {
             }
             value = angleOf(roi)
         } else {
+            if (viewSpec.scalePx <= 0) {
+                openSettings(curViewName, "Set the scale for view '${curViewName}' " +
+                    'before recording lengths.')
+                return
+            }
             if (roi.getType() != Roi.LINE) {
                 IJ.showMessage("'${spec.name}' needs a straight line selection.")
                 return
@@ -658,7 +814,7 @@ class App {
         }
 
         roi.setName(spec.name)
-        rois[spec.name] = roi
+        rois[spec.name] = (Roi) roi.clone()
 
         // recording confirms the view for this image
         assign[basename(curImg)] = curViewName
@@ -732,7 +888,50 @@ class App {
         IJ.showMessage('No incomplete images in the current list.')
     }
 
+    // ---------- settings ----------
+
+    void openSettings(String view, String message) {
+        if (settings != null) {
+            settings.frame.toFront()
+            if (message) settings.setHint(message)
+            return
+        }
+        settings = new SettingsWindow(this, view ?: curViewName ?: views[0].name, message)
+    }
+
+    /** Called by the settings window after the config has been written. */
+    void settingsSaved() {
+        applyCalibration()
+        refreshMeasList()
+        refreshImageList()
+    }
+
+    /** Recomputes a view's recorded lengths from their saved line ROIs with
+     *  the view's current scale. Returns [updated, without a saved ROI]. */
+    List recalcLengths(String view) {
+        def spec = viewByName[view]
+        int updated = 0, missing = 0
+        store.rows.findAll { it.View == view && it.Type == 'length' }
+             .groupBy { it.Image }
+             .each { String img, List rows ->
+                 Map saved = loadRois(new File(roiDir, img + '_RoiSet.zip').getAbsolutePath())
+                 rows.each { Map r ->
+                     def roi = saved[r.Structure]
+                     if (roi != null && roi.getType() == Roi.LINE) {
+                         double px = Math.hypot(roi.x2d - roi.x1d, roi.y2d - roi.y1d)
+                         r.Value = String.format('%.5f', px * spec.scaleKnown / spec.scalePx)
+                         updated++
+                     } else {
+                         missing++
+                     }
+                 }
+             }
+        store.save()
+        return [updated, missing]
+    }
+
     void finish() {
+        settings?.frame?.dispose()
         store.save()
         saveAssignments()
         if (imp != null) {
@@ -740,8 +939,334 @@ class App {
             imp.close()
         }
         rm.close()
+        Prefs.set(PREF_LOC, frame.getX() + ',' + frame.getY())
         frame.dispose()
         IJ.log('Session ended. Results: ' + store.path)
+    }
+}
+
+// ------------------------------------------------------------
+//  settings window
+// ------------------------------------------------------------
+
+/** Per-view scale and default start positions. Edits are held here until
+ *  Save, which writes them to the config file and applies them. */
+class SettingsWindow {
+
+    App app
+    JFrame frame
+    JComboBox viewCombo
+    JTextField pxField, knownField, unitField
+    JButton scaleBtn
+    JList posList
+    DefaultListModel posModel
+    JLabel hint
+
+    Map work = [:]                   // view name -> editable copy
+    String shown = null              // view currently in the fields
+    boolean measuringScale = false
+
+    SettingsWindow(App app, String view, String message) {
+        this.app = app
+        app.views.each { Map v ->
+            work[v.name] = [px   : num(v.scalePx), known: num(v.scaleKnown), unit: v.unit,
+                            pos  : v.meas.collectEntries { [(it.name): it.pos] }]
+        }
+        build()
+        viewCombo.setSelectedItem(view)
+        showView(view)
+        setHint(message ?: 'Changes apply when you click Save.')
+        place()
+        frame.setVisible(true)
+    }
+
+    static String num(double d) {
+        return d == Math.rint(d) ? String.valueOf((long) d) : String.valueOf(d)
+    }
+
+    static Double parse(String s) {
+        try { return Double.parseDouble(s.trim()) } catch (NumberFormatException e) { return null }
+    }
+
+    void setHint(String text) {
+        String esc = text.replace('&', '&amp;').replace('<', '&lt;')
+        hint.setText('<html><body style="width:260px">' + esc + '</body></html>')
+    }
+
+    // ---------- gui ----------
+
+    void build() {
+        frame = new JFrame('Morphometrics settings')
+        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE)
+        frame.addWindowListener(new WindowAdapter() {
+            void windowClosed(WindowEvent e) { app.settings = null }
+        })
+
+        def viewPanel = new JPanel(new BorderLayout())
+        viewCombo = new JComboBox(app.views.collect { it.name } as String[])
+        viewCombo.addActionListener {
+            String v = viewCombo.getSelectedItem()
+            if (v != shown) { commit(); showView(v) }
+        }
+        viewPanel.add(new JLabel('View: '), BorderLayout.WEST)
+        viewPanel.add(viewCombo, BorderLayout.CENTER)
+
+        // ----- scale -----
+        def scale = new JPanel(new GridLayout(0, 2, 4, 4))
+        scale.setBorder(BorderFactory.createTitledBorder('Scale'))
+        pxField = new JTextField(8)
+        knownField = new JTextField(8)
+        unitField = new JTextField(8)
+        scale.add(new JLabel('Scale bar length (px)'))
+        scale.add(pxField)
+        scale.add(new JLabel('Known length'))
+        scale.add(knownField)
+        scale.add(new JLabel('Unit'))
+        scale.add(unitField)
+        scale.add(new JLabel(''))
+        scaleBtn = new JButton('Measure scale bar')
+        scaleBtn.addActionListener { measureScale() }
+        scale.add(scaleBtn)
+
+        // ----- default positions -----
+        def pos = new JPanel(new BorderLayout(4, 4))
+        pos.setBorder(BorderFactory.createTitledBorder('Default start positions'))
+        posModel = new DefaultListModel()
+        posList = new JList(posModel)
+        posList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION)
+        posList.addListSelectionListener { e ->
+            if (!e.getValueIsAdjusting()) syncMainSelection()
+        }
+        def sp = new JScrollPane(posList)
+        sp.setPreferredSize(new Dimension(300, 140))
+        pos.add(sp, BorderLayout.CENTER)
+        def posBtns = new JPanel(new GridLayout(1, 2, 4, 4))
+        def useSel = new JButton('Use selection on image')
+        useSel.addActionListener { takePosition() }
+        def reset = new JButton('Reset to standard')
+        reset.addActionListener { resetPosition() }
+        posBtns.add(useSel)
+        posBtns.add(reset)
+        pos.add(posBtns, BorderLayout.SOUTH)
+
+        def center = new JPanel()
+        center.setLayout(new BoxLayout(center, BoxLayout.Y_AXIS))
+        center.add(scale)
+        center.add(pos)
+
+        // ----- hint + save/cancel -----
+        hint = new JLabel(' ')
+        def saveBtn = new JButton('Save')
+        saveBtn.addActionListener { save() }
+        def cancelBtn = new JButton('Cancel')
+        cancelBtn.addActionListener { frame.dispose() }
+        def btns = new JPanel(new GridLayout(1, 2, 4, 4))
+        btns.add(cancelBtn)
+        btns.add(saveBtn)
+        def south = new JPanel(new BorderLayout(4, 4))
+        south.add(hint, BorderLayout.CENTER)
+        south.add(btns, BorderLayout.SOUTH)
+
+        def main = new JPanel(new BorderLayout(8, 8))
+        main.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8))
+        main.add(viewPanel, BorderLayout.NORTH)
+        main.add(center, BorderLayout.CENTER)
+        main.add(south, BorderLayout.SOUTH)
+        frame.add(main)
+        frame.pack()
+        frame.setAlwaysOnTop(app.frame.isAlwaysOnTop())
+    }
+
+    /** Beside the main window, bottom-aligned with it. */
+    void place() {
+        def screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds()
+        int x = app.frame.getX() - frame.getWidth() - 10
+        if (x < screen.x) x = app.frame.getX() + app.frame.getWidth() + 10
+        if (x + frame.getWidth() > screen.x + screen.width) x = screen.x
+        int y = app.frame.getY() + app.frame.getHeight() - frame.getHeight()
+        int top = screen.y
+        frame.setLocation(x, Math.max(top, y))
+    }
+
+    // ---------- editing ----------
+
+    void showView(String v) {
+        shown = v
+        def w = work[v]
+        pxField.setText(w.px)
+        knownField.setText(w.known)
+        unitField.setText(w.unit)
+        refreshPositions(-1)
+    }
+
+    /** Copies the scale fields back into the working copy. */
+    void commit() {
+        if (shown == null) return
+        def w = work[shown]
+        w.px = pxField.getText().trim()
+        w.known = knownField.getText().trim()
+        w.unit = unitField.getText().trim()
+    }
+
+    void refreshPositions(int select) {
+        posModel.clear()
+        app.viewByName[shown].meas.each { Map m ->
+            String state = work[shown].pos[m.name] ? 'custom' : 'standard'
+            posModel.addElement(String.format('%-18s %-7s %s', m.name, m.type, state))
+        }
+        if (select >= 0) posList.setSelectedIndex(select)
+    }
+
+    /** Selecting a measurement here selects it in the main window too, so
+     *  its line/angle is on the image ready to adjust. */
+    void syncMainSelection() {
+        int i = posList.getSelectedIndex()
+        if (i >= 0 && app.curViewName == shown && i < app.measModel.getSize())
+            app.measList.setSelectedIndex(i)
+    }
+
+    void measureScale() {
+        def imp = app.imp
+        if (imp == null) {
+            setHint('Open an image first.')
+            return
+        }
+        if (!measuringScale) {
+            measuringScale = true
+            imp.deleteRoi()
+            IJ.setTool('line')
+            scaleBtn.setText('Use drawn line')
+            setHint('Draw a straight line along the scale bar on the image, ' +
+                    'then click "Use drawn line".')
+            return
+        }
+        def roi = imp.getRoi()
+        if (roi == null || roi.getType() != Roi.LINE) {
+            setHint('No straight line on the image. Draw one along the scale bar, ' +
+                    'then click "Use drawn line".')
+            return
+        }
+        measuringScale = false
+        scaleBtn.setText('Measure scale bar')
+        double px = Math.hypot(roi.x2d - roi.x1d, roi.y2d - roi.y1d)
+        pxField.setText(String.format('%.2f', px))
+        String note = app.curViewName == shown ? '' :
+            " (measured on a '${app.curViewName}' image)"
+        setHint("Scale bar is ${String.format('%.2f', px)} px${note}. " +
+                'Check its known length and unit, then Save.')
+    }
+
+    void takePosition() {
+        int i = posList.getSelectedIndex()
+        if (i < 0) {
+            setHint('Pick a measurement in the list first.')
+            return
+        }
+        def m = app.viewByName[shown].meas[i]
+        def imp = app.imp
+        def roi = imp?.getRoi()
+        boolean ok = roi != null &&
+            roi.getType() == (m.type == 'angle' ? Roi.ANGLE : Roi.LINE)
+        if (!ok) {
+            setHint("Draw ${m.type == 'angle' ? 'an angle' : 'a straight line'} " +
+                    "on the image where '${m.name}' should start.")
+            return
+        }
+        double w = imp.getWidth(), h = imp.getHeight()
+        List v
+        if (m.type == 'angle') {
+            def p = roi.getFloatPolygon()
+            v = (0..2).collectMany { [p.xpoints[it] / w, p.ypoints[it] / h] }
+        } else {
+            v = [roi.x1d / w, roi.y1d / h, roi.x2d / w, roi.y2d / h]
+        }
+        work[shown].pos[m.name] = v.collect { Math.round(it * 10000) / 10000.0d }
+        refreshPositions(i)
+        setHint("Start position for '${m.name}' taken from the image. Save to keep it.")
+    }
+
+    void resetPosition() {
+        int i = posList.getSelectedIndex()
+        if (i < 0) return
+        def m = app.viewByName[shown].meas[i]
+        work[shown].pos[m.name] = null
+        refreshPositions(i)
+    }
+
+    // ---------- save ----------
+
+    void save() {
+        commit()
+
+        // validate every view before writing anything
+        def parsed = [:]
+        for (Map v : app.views) {
+            def w = work[v.name]
+            Double px = parse(w.px), known = parse(w.known)
+            String bad = px == null || px < 0 ? 'Scale bar length must be a number (0 = not set).' :
+                         known == null || known <= 0 ? 'Known length must be a number above 0.' :
+                         !w.unit ? 'Unit cannot be empty.' : null
+            if (bad) {
+                viewCombo.setSelectedItem(v.name)
+                setHint("View '${v.name}': ${bad}")
+                return
+            }
+            parsed[v.name] = [px: px, known: known]
+        }
+
+        // only rewrite keys that changed, so the config keeps its shape
+        def updates = [:]
+        def rescaled = []
+        app.views.each { Map v ->
+            def w = work[v.name], p = parsed[v.name]
+            String pfx = 'view.' + v.name + '.'
+            if (p.px != v.scalePx) updates[pfx + 'scale_distance_px'] = num(p.px)
+            if (p.known != v.scaleKnown) updates[pfx + 'scale_known'] = num(p.known)
+            if (w.unit != v.unit) updates[pfx + 'scale_unit'] = w.unit
+            v.meas.each { Map m ->
+                def np = w.pos[m.name]
+                if (np != m.pos)
+                    updates[pfx + 'position.' + m.name] = np ? np.collect { num(it) }.join(', ') : null
+            }
+            if (v.scalePx > 0 && (p.px != v.scalePx || p.known != v.scaleKnown)) rescaled << v.name
+        }
+        if (!updates) {
+            frame.dispose()
+            return
+        }
+
+        try {
+            ConfigFile.update(new File(app.cfgPath), updates)
+        } catch (IOException e) {
+            setHint('Could not write the config file: ' + e.getMessage())
+            return
+        }
+
+        app.views.each { Map v ->
+            def w = work[v.name], p = parsed[v.name]
+            v.scalePx = p.px
+            v.scaleKnown = p.known
+            v.unit = w.unit
+            v.meas.each { Map m -> m.pos = w.pos[m.name] }
+        }
+
+        rescaled.each { String vn ->
+            int n = app.store.rows.count { it.View == vn && it.Type == 'length' }
+            if (n == 0) return
+            int ans = JOptionPane.showConfirmDialog(frame,
+                "${n} length measurement(s) for view '${vn}' were recorded with the old scale.\n" +
+                'Recalculate them from their saved lines using the new scale?',
+                'Scale changed', JOptionPane.YES_NO_OPTION)
+            if (ans == JOptionPane.YES_OPTION) {
+                def (int updated, int missing) = app.recalcLengths(vn)
+                String msg = "Recalculated ${updated} measurement(s)."
+                if (missing) msg += "\n${missing} had no saved line and still use the old scale."
+                JOptionPane.showMessageDialog(frame, msg)
+            }
+        }
+
+        app.settingsSaved()
+        frame.dispose()
     }
 }
 
@@ -749,23 +1274,49 @@ class App {
 //  entry point
 // ------------------------------------------------------------
 
-def od = new OpenDialog('Select config file', null)
-if (od.getFileName() != null) {
-    String cfgPath = new File(od.getDirectory(), od.getFileName()).getAbsolutePath()
-    def cfg = parseConfig(cfgPath)
+final String CONFIG_NAME = 'morphometrics_config.txt'
 
-    def dc = new DirectoryChooser('Choose the image folder')
-    String folder = dc.getDirectory()
+def dc = new DirectoryChooser('Choose the image folder')
+String folder = dc.getDirectory()
 
-    if (folder != null) {
+if (folder != null) {
+    def cfgFile = new File(folder, CONFIG_NAME)
+    boolean editorOpen = false
+
+    // Opens the config for editing and waits; false if the user cancels.
+    def waitForEdit = { String problem ->
+        if (!editorOpen) {
+            IJ.open(cfgFile.getAbsolutePath())
+            editorOpen = true
+        }
+        String msg = (problem ? 'Configuration problem:\n' + problem + '\n\n' : '') +
+                     'Edit and save\n' + cfgFile.getAbsolutePath() +
+                     '\nthen click OK. Cancel to quit.'
+        def w = new WaitForUserDialog('Edit configuration', msg)
+        w.show()
+        return !w.escPressed()
+    }
+
+    boolean go = true
+    if (!cfgFile.exists()) {
+        go = IJ.showMessageWithCancel('No configuration',
+            "No ${CONFIG_NAME} found in\n${folder}\n\nCreate one from a template?")
+        if (go) {
+            writeConfigTemplate(cfgFile)
+            go = waitForEdit(null)
+        }
+    }
+
+    while (go) {
         try {
-            new App(cfg, folder,
+            new App(parseConfig(cfgFile.getAbsolutePath()), cfgFile.getAbsolutePath(), folder,
                     { String s -> splitCsvLine(s) },
                     { Object v -> csvField(v) },
                     { String s -> parseMeasurements(s) },
                     { Map c, Closure mp -> parseViews(c, mp) })
+            break
         } catch (IllegalArgumentException e) {
-            IJ.showMessage('Configuration problem', e.getMessage())
+            go = waitForEdit(e.getMessage())
         }
     }
 }
