@@ -1,0 +1,64 @@
+# Example Morphometrics Helper configuration
+#
+# Copy this file into your image folder (keep the name morphometrics_config.txt)
+# and adjust it. Lines starting with # are comments. Format: key = value
+#
+# This example is for zebrafish larvae imaged in a repeating sequence of
+# three shots per fish:
+#   1. ventral view at 4x   (craniofacial cartilage close-up)
+#   2. ventral view at 2x   (whole head)
+#   3. lateral view at 2x   (whole body)
+# so the image folder, sorted by name, looks like:
+#   fish01_a.tif  fish01_b.tif  fish01_c.tif  fish02_a.tif  fish02_b.tif ...
+
+# The views, comma-separated. Any names will do.
+views = ventral_4x, ventral_2x, lateral_2x
+
+# The order the views repeat in across the sorted image list. The helper uses
+# it to predict each image's view; you can correct any prediction in the app.
+view_cycle = ventral_4x, ventral_2x, lateral_2x
+
+# ---- Per-view settings: view.<name>.<key> ----
+#   scale_distance_px  length of a scale bar in pixels (0 = not set yet; the
+#                      Settings window opens so you can measure it on an image)
+#   scale_known        real length of that scale bar
+#   scale_unit         unit of scale_known
+#   measurements       name[:type] entries separated by ';'. type is length or
+#                      angle. If omitted, names ending in _angle are angles and
+#                      everything else is a length. Names ending in _width start
+#                      with a vertical line, other lengths with a horizontal one.
+#   position.<name>    where a measurement's line/angle first appears, as
+#                      fractions of image width/height. Easiest to set from the
+#                      Settings window.
+#
+# The scale values below are placeholders - measure your own scale bars.
+
+view.ventral_4x.scale_distance_px = 1480
+view.ventral_4x.scale_known = 1
+view.ventral_4x.scale_unit = mm
+view.ventral_4x.measurements = meckels_length; palatoquadrate_length; ceratohyal_length; ceratohyal_angle
+view.ventral_4x.position.ceratohyal_angle = 0.62, 0.38, 0.48, 0.5, 0.62, 0.62
+
+view.ventral_2x.scale_distance_px = 740
+view.ventral_2x.scale_known = 1
+view.ventral_2x.scale_unit = mm
+view.ventral_2x.measurements = head_length; head_width; interocular_width
+
+view.lateral_2x.scale_distance_px = 740
+view.lateral_2x.scale_known = 1
+view.lateral_2x.scale_unit = mm
+view.lateral_2x.measurements = standard_length; head_depth; eye_diameter; body_depth:length; jaw_angle
+
+# ---- Optional settings (defaults shown) ----
+# image_extensions = .jpg,.jpeg,.tif,.tiff,.png
+# roi_subdir = RoiSets
+# output_long = measurements_long.csv
+# view_assign = image_views.csv
+# zoom_state = zoom_state.csv
+
+# Zoom memory: each Record remembers the zoom, visible area and window size,
+# and restores them later so the subject is framed the same way every time.
+#   measurement  per view and measurement, restored when it is selected
+#   view         one per view, restored when an image opens
+#   off          never change the zoom
+# zoom_memory = measurement
