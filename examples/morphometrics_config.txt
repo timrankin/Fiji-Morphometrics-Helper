@@ -19,6 +19,8 @@ views = ventral_4x, ventral_2x, lateral_2x
 view_cycle = ventral_4x, ventral_2x, lateral_2x
 
 # ---- Per-view settings: view.<name>.<key> ----
+# A key without the view.<name>. prefix (e.g. scale_unit = um) applies to
+# every view that doesn't set its own.
 #   scale_distance_px  length of a scale bar in pixels (0 = not set yet; the
 #                      Settings window opens so you can measure it on an image)
 #   scale_known        real length of that scale bar
