@@ -1,5 +1,5 @@
 // ============================================================
-//  Zebrafish morphometrics - Fiji / Groovy
+//  Morphometrics Helper - Fiji / Groovy
 //  Script Editor: Language > Groovy, then Run
 // ============================================================
 
@@ -7,6 +7,7 @@ import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.GraphicsEnvironment
 import java.awt.GridLayout
+import java.awt.Rectangle
 import java.awt.event.WindowAdapter
 import java.awt.event.WindowEvent
 
@@ -91,6 +92,14 @@ view.dorsal.measurements = head_width; interocular_width; fin_angle
 # roi_subdir = RoiSets
 # output_long = measurements_long.csv
 # view_assign = image_views.csv
+# zoom_state = zoom_state.csv
+
+# Zoom memory: each Record remembers the zoom and image position, and they
+# are restored later so the subject is framed the same way on every image.
+#   measurement  per view and measurement, restored when it is selected
+#   view         one per view, restored when an image opens
+#   off          never change the zoom
+# zoom_memory = measurement
 ''', 'UTF-8')
 }
 
@@ -319,6 +328,9 @@ class App {
     String roiDir, assignPath
     Store store
 
+    String zoomMode, zoomPath
+    Map zooms = [:]                  // view -> (measurement or '' -> zoom state, see rememberZoom)
+
     Map assign = [:]                 // basename -> view name (confirmed)
     Map viewSpec                     // spec of the currently open image
     String curViewName = null
@@ -371,6 +383,12 @@ class App {
         this.assignPath = new File(folder,
             cfg.get('view_assign', 'image_views.csv')).getAbsolutePath()
         loadAssignments(splitter)
+
+        this.zoomMode = cfg.get('zoom_memory', 'measurement').toLowerCase()
+        if (!(zoomMode in ['measurement', 'view', 'off']))
+            throw new IllegalArgumentException('config: zoom_memory must be measurement, view or off')
+        this.zoomPath = new File(folder, cfg.get('zoom_state', 'zoom_state.csv')).getAbsolutePath()
+        loadZooms(splitter)
         migrateFromStore()
 
         this.rm = new RoiManager(false)     // hidden scratch manager, zip I/O only
@@ -672,6 +690,7 @@ class App {
         newImp.show()
         imp = newImp
         applyCalibration()
+        if (zoomMode == 'view') restoreZoom(null)
 
         rois = loadRois(roiPath(i))
 
@@ -719,6 +738,7 @@ class App {
 
         applyCalibration()
         if (imp != null) imp.deleteRoi()
+        if (zoomMode == 'view') restoreZoom(null)
 
         refreshMeasList()
         refreshImageList()
@@ -780,6 +800,7 @@ class App {
                 imp.setRoi(new Line(w * 0.40, h * 0.50, w * 0.60, h * 0.50))
             }
         }
+        if (zoomMode == 'measurement') restoreZoom(spec.name)
     }
 
     void record() {
@@ -821,6 +842,7 @@ class App {
         saveAssignments()
 
         store.put(folderName, basename(curImg), curViewName, spec.name, spec.type, value)
+        rememberZoom(spec.name)
         saveRois()
 
         refreshMeasList()
@@ -886,6 +908,89 @@ class App {
             }
         }
         IJ.showMessage('No incomplete images in the current list.')
+    }
+
+    // ---------- zoom memory ----------
+
+    void loadZooms(Closure splitter) {
+        def f = new File(zoomPath)
+        if (!f.exists()) return
+        f.readLines().drop(1).each { String line ->
+            def v = splitter(line)
+            if (v.size() < 5) return
+            try {
+                def z = v.drop(2).findAll { it }.collect { Double.parseDouble(it) }
+                (zooms[v[0]] ?: (zooms[v[0]] = [:]))[v[1]] = z
+            } catch (NumberFormatException ignored) { }
+        }
+    }
+
+    void saveZooms() {
+        def sb = new StringBuilder('View,Measurement,Magnification,CenterX,CenterY,' +
+                                   'CanvasWidth,CanvasHeight,WindowX,WindowY\n')
+        zooms.each { String view, Map byMeas ->
+            byMeas.each { String meas, List z ->
+                sb.append(([view, meas] + z).join(',')).append('\n')
+            }
+        }
+        new File(zoomPath).setText(sb.toString(), 'UTF-8')
+    }
+
+    /** Stores the current framing for the view, and for the measurement when
+     *  remembering per measurement: [magnification, centre x, centre y (as
+     *  fractions of the image), canvas width, canvas height, window x, y].
+     *  The view entry is also the fallback for unvisited measurements. */
+    void rememberZoom(String meas) {
+        def canvas = imp?.getCanvas()
+        def win = imp?.getWindow()
+        if (zoomMode == 'off' || canvas == null || win == null) return
+        Rectangle r = canvas.getSrcRect()
+        def z = [canvas.getMagnification(),
+                 (r.x + r.width / 2.0d) / imp.getWidth(),
+                 (r.y + r.height / 2.0d) / imp.getHeight(),
+                 canvas.getWidth(), canvas.getHeight(), win.getX(), win.getY()]
+        def byMeas = zooms[curViewName] ?: (zooms[curViewName] = [:])
+        byMeas[''] = z
+        if (zoomMode == 'measurement') byMeas[meas] = z
+        saveZooms()
+    }
+
+    /** Sets magnification, visible area and canvas size directly. Zoom.set()
+     *  is avoided because it re-centres on the selection and picks its own
+     *  window size. */
+    void restoreZoom(String meas) {
+        def canvas = imp?.getCanvas()
+        def win = imp?.getWindow()
+        def byMeas = zooms[curViewName]
+        if (canvas == null || win == null || !byMeas) return
+        def z = (meas != null ? byMeas[meas] : null) ?: byMeas['']
+        if (!z) return
+
+        double mag = z[0]
+        int iw = imp.getWidth(), ih = imp.getHeight()
+        double cw = z.size() >= 5 ? z[3] : canvas.getWidth()
+        double ch = z.size() >= 5 ? z[4] : canvas.getHeight()
+        int sw = Math.min(iw, (int) Math.round(cw / mag))
+        int sh = Math.min(ih, (int) Math.round(ch / mag))
+        int sx = (int) Math.round(z[1] * iw - sw / 2.0d)
+        int sy = (int) Math.round(z[2] * ih - sh / 2.0d)
+        sx = Math.max(0, Math.min(iw - sw, sx))
+        sy = Math.max(0, Math.min(ih - sh, sy))
+        def src = new Rectangle(sx, sy, sw, sh)
+
+        if (canvas.getMagnification() != mag || canvas.getSrcRect() != src) {
+            canvas.setMagnification(mag)
+            canvas.setSourceRect(src)
+            canvas.setSize((int) Math.round(sw * mag), (int) Math.round(sh * mag))
+            win.pack()
+        }
+        if (z.size() >= 7) {
+            int wx = z[5], wy = z[6]
+            def screen = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds()
+            if (screen.contains(wx + 20, wy + 20) && (win.getX() != wx || win.getY() != wy))
+                win.setLocation(wx, wy)
+        }
+        canvas.repaint()
     }
 
     // ---------- settings ----------
